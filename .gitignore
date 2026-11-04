@@ -4,5 +4,7 @@ __pycache__/
 *.pyc
 debug_pages/
 scripts/
+# 开发测试仅保存在本地
+/tests/
 _page.html
 _oauth*
