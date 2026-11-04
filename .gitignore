@@ -1,10 +1,19 @@
 .env
+.env.*
+!.env.example
 __pycache__/
 .venv/
 *.pyc
+*.log
+*.tmp
+*.bak
+.pytest_cache/
+.ruff_cache/
+node_modules/
 debug_pages/
 scripts/
 # 开发测试仅保存在本地
 /tests/
+/docs/dependencies.json
 _page.html
 _oauth*

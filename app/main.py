@@ -1,31 +1,36 @@
 """Telegram API 凭据自助申请服务 — FastAPI 入口。
 
 安全与防滥用：PoW 工作量证明人机验证（防脚本轰炸）、每 IP 限流、
-每手机号冷却、全局并发上限、统一响应包络 + 错误码表、统计打点（ADMIN_TOKEN 保护）。
+每手机号冷却、全局并发上限、统一响应包络 + 错误码表、首页公开汇总统计。
 流程状态为内存态（默认有效期 10 分钟，可配置）；部署约束见 README。
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import random
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
+from html import escape
+from math import ceil
 from pathlib import Path
 from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
-
-import hashlib
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from mytelegram import MyTelegramError, TelegramWebClient, normalize_phone
 
 BASE_DIR = Path(__file__).parent             # app/ 目录（代码与静态资源）
 PROJECT_ROOT = Path(__file__).parent.parent  # 项目根目录（.env 所在）
+VERSION = "0.2.0"
+_MAX_REQUEST_BODY = 16 * 1024
 
 
 def _int_env(key: str, default: int) -> int:
@@ -45,8 +50,8 @@ _load_env()
 # 运行参数：全部可由 .env 覆盖，不填使用默认值
 TTL_SECONDS = _int_env("TTL_SECONDS", 10 * 60)  # 申请流程状态有效期（秒）
 CODE_ATTEMPT_LIMIT = _int_env("CODE_ATTEMPT_LIMIT", 3)  # 单流程验证码最大输错次数（输错也消耗 Telegram 频控配额）
-IP_SEND_LIMIT = _int_env("IP_SEND_LIMIT", 5)  # 每 IP 每小时最多发起发码次数
-PHONE_COOLDOWN = _int_env("PHONE_COOLDOWN", 180)  # 同一手机号两次发码最小间隔（秒）
+IP_SEND_LIMIT = _int_env("IP_SEND_LIMIT", 5)  # 每 IP 每小时最多发起验证码发送次数
+PHONE_COOLDOWN = _int_env("PHONE_COOLDOWN", 180)  # 同一手机号两次验证码发送最小间隔（秒）
 FLOW_SLOTS = _int_env("FLOW_SLOTS", 5)  # 全局同时在途申请流程上限
 
 
@@ -65,7 +70,6 @@ def build_proxy(session_id: str) -> str:
     return f"{scheme}://{quote(user, safe='')}:{quote(pwd, safe='')}@{host}:{port}"
 
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 # 接口文档（/docs、/openapi.json）默认关闭，防止公网暴露接口说明书；本地调试设 ENABLE_DOCS=1
 ENABLE_DOCS = os.getenv("ENABLE_DOCS", "").strip() == "1"
 # PoW（工作量证明）人机验证：客户端需在 [0, maxnumber) 中找到使
@@ -76,9 +80,34 @@ POW_IP_LIMIT = _int_env("POW_IP_LIMIT", 20)  # 每 IP 每分钟获取挑战上�
 POW_IP_PENDING_LIMIT = _int_env("POW_IP_PENDING_LIMIT", 3)  # 每 IP 未消费挑战上限
 POW_POOL_LIMIT = _int_env("POW_POOL_LIMIT", 8000)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    stop = asyncio.Event()
+
+    async def maintain():
+        while not stop.is_set():
+            await _cleanup_expired()
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=min(30, TTL_SECONDS, POW_TTL, PHONE_COOLDOWN))
+            except asyncio.TimeoutError:
+                pass
+
+    maintenance = asyncio.create_task(maintain())
+    try:
+        yield
+    finally:
+        stop.set()
+        await maintenance
+        remaining = list(_state.values())
+        _state.clear()
+        await asyncio.gather(*(_close_flow(state) for state in remaining))
+
+
 app = FastAPI(
     title="Telegram API 凭据自助申请",
     description="自动化完成 my.telegram.org 创建应用流程，代用户获取 api_id / api_hash",
+    version=VERSION,
+    lifespan=lifespan,
     docs_url="/docs" if ENABLE_DOCS else None,
     redoc_url=None,
     openapi_url="/openapi.json" if ENABLE_DOCS else None,
@@ -96,10 +125,11 @@ E_STATE_EXPIRED = 2003
 E_TELEGRAM = 2004
 E_BLOCKED = 2005
 E_NETWORK = 2006
+E_REQUEST_INVALID = 1000
 
 
 def ok(data: dict | None = None, message: str = "ok") -> JSONResponse:
-    return JSONResponse({"code": 0, "message": message, "data": data or {}})
+    return JSONResponse({"code": 0, "message": message, "data": data or {}}, headers={"Cache-Control": "no-store"})
 
 
 def fail(code: int, message: str, original: str = "", extra: dict | None = None) -> JSONResponse:
@@ -109,7 +139,28 @@ def fail(code: int, message: str, original: str = "", extra: dict | None = None)
     if code == E_TELEGRAM:
         # 诊断日志：只记录 Telegram 返回的响应内容，不记录手机号/验证码等用户输入
         print(f"[mytelegram] code={code} original={original[:200]}", flush=True)
-    return JSONResponse({"code": code, "message": message, "data": data})
+    return JSONResponse({"code": code, "message": message, "data": data}, headers={"Cache-Control": "no-store"})
+
+
+async def _read_json_body(req: Request) -> dict | JSONResponse:
+    def invalid(message: str, status: int) -> JSONResponse:
+        return JSONResponse({"code": E_REQUEST_INVALID, "message": message, "data": {}},
+                            status_code=status, headers={"Cache-Control": "no-store"})
+
+    if req.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        return invalid("请求必须使用 application/json 格式", 415)
+    body = bytearray()
+    async for chunk in req.stream():
+        if len(body) + len(chunk) > _MAX_REQUEST_BODY:
+            return invalid("请求内容过大", 413)
+        body.extend(chunk)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return invalid("请求不是有效的 JSON", 400)
+    if not isinstance(data, dict):
+        return invalid("请求内容必须是 JSON 对象", 400)
+    return data
 
 
 # ---- 内存态（重启即丢）----
@@ -117,9 +168,10 @@ def fail(code: int, message: str, original: str = "", extra: dict | None = None)
 _state: dict[str, dict] = {}
 _flow_slots = asyncio.BoundedSemaphore(FLOW_SLOTS)
 
-# 每 IP 发码时间戳（滑动窗口）；手机号 -> 上次发码时间
-# PoW 挑战：challenge_id -> {ip, salt, number, challenge, maxnumber, created}（单次有效）
+# 每 IP 验证码发送时间戳（滑动窗口）；手机号 -> 上次验证码发送时间
+# PoW 挑战：challenge_id -> {ip, request_id, salt, number, challenge, maxnumber, created}（单次有效）
 _pow_challenges: dict[str, dict] = {}
+_SERVER_INSTANCE = uuid.uuid4().hex
 _pow_ip_hits: dict[str, list[float]] = {}
 _ip_hits: dict[str, list[float]] = {}
 _phone_last: dict[str, float] = {}
@@ -132,17 +184,24 @@ _stats: dict = {
     "create_existed": 0,
     "create_fail": {},
 }
+_stats_revision = 0
+_stats_waiters: set[asyncio.Future] = set()
 
 
 def _bump(bucket: str, kind: str = "ok") -> None:
+    global _stats_revision
     if kind == "ok":
         _stats[bucket] = _stats.get(bucket, 0) + 1
     else:
         fails = _stats.setdefault(bucket, {})
         fails[kind] = fails.get(kind, 0) + 1
+    _stats_revision += 1
+    for waiter in tuple(_stats_waiters):
+        if not waiter.done():
+            waiter.set_result(None)
 
 
-def _tg_err(e: MyTelegramError) -> JSONResponse:
+def _tg_err(e: MyTelegramError, *, flow_closed: bool = False) -> JSONResponse:
     code_map = {
         "phone_invalid": E_PHONE_INVALID,
         "flood": E_FLOOD,
@@ -150,7 +209,8 @@ def _tg_err(e: MyTelegramError) -> JSONResponse:
         "blocked": E_BLOCKED,
         "network": E_NETWORK,
     }
-    return fail(code_map.get(e.kind, E_TELEGRAM), e.message, e.original)
+    return fail(code_map.get(e.kind, E_TELEGRAM), e.message, e.original,
+                {"flow_closed": True} if flow_closed else None)
 
 
 async def _close_flow(state: dict) -> None:
@@ -191,7 +251,19 @@ async def _cleanup_expired() -> None:
         _phone_last.pop(phone, None)
 
 
-def _new_pow_challenge(ip: str) -> dict:
+def _public_pow(cid: str, item: dict) -> dict:
+    return {
+        "challenge_id": cid,
+        "algorithm": "SHA-256",
+        "salt": item["salt"],
+        "challenge": item["challenge"],
+        "maxnumber": item["maxnumber"],
+        "expires_at": item["created"] + POW_TTL,
+        "server_instance": _SERVER_INSTANCE,
+    }
+
+
+def _new_pow_challenge(ip: str, request_id: str) -> dict:
     # 防内存 DoS：未消费挑战堆积上限（正常流量远达不到，脚本刷量会被拒）
     if len(_pow_challenges) >= POW_POOL_LIMIT:
         return {}
@@ -201,20 +273,14 @@ def _new_pow_challenge(ip: str) -> dict:
     cid = uuid.uuid4().hex
     _pow_challenges[cid] = {
         "ip": ip,
+        "request_id": request_id,
         "salt": salt,
         "number": number,
         "challenge": challenge,
         "maxnumber": POW_MAXNUMBER,
         "created": time.time(),
     }
-    return {
-        "challenge_id": cid,
-        "algorithm": "SHA-256",
-        "salt": salt,
-        "challenge": challenge,
-        "maxnumber": POW_MAXNUMBER,
-        "expires_at": _pow_challenges[cid]["created"] + POW_TTL,
-    }
+    return _public_pow(cid, _pow_challenges[cid])
 
 
 def _check_pow(challenge_id: str, nonce: str, ip: str) -> bool:
@@ -266,13 +332,20 @@ async def pow_challenge(req: Request):
     """下发 PoW 挑战（盐值 + 目标哈希），客户端暴力搜索 nonce 后回传验证。"""
     await _cleanup_expired()
     ip = _client_ip(req)
+    request_id = req.query_params.get("request_id", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        return fail(E_CAPTCHA, "人机验证请求标识无效，请刷新页面")
+    # 同一标签页刷新或响应中断后复用原题，不新增待完成验证或消耗发题配额。
+    for cid, item in _pow_challenges.items():
+        if item["ip"] == ip and item["request_id"] == request_id:
+            return ok(_public_pow(cid, item))
     hits = _pow_ip_hits.setdefault(ip, [])
     if len(hits) >= POW_IP_LIMIT:
         return fail(E_IP_LIMITED, "人机验证请求过于频繁，请一分钟后重试")
     hits.append(time.time())
     if sum(v["ip"] == ip for v in _pow_challenges.values()) >= POW_IP_PENDING_LIMIT:
         return fail(E_IP_LIMITED, "未完成的人机验证过多，请完成已有验证或等待其过期")
-    challenge = _new_pow_challenge(ip)
+    challenge = _new_pow_challenge(ip, request_id)
     if not challenge:
         return fail(E_BUSY, "当前请求人数较多，请稍后再试")
     return ok(challenge)
@@ -281,7 +354,9 @@ async def pow_challenge(req: Request):
 @app.post("/api/send-code")
 async def send_code(req: Request):
     await _cleanup_expired()
-    body = await req.json()
+    body = await _read_json_body(req)
+    if isinstance(body, JSONResponse):
+        return body
     ip = _client_ip(req)
 
     # 人机校验：PoW 工作量证明（零注册、零第三方，客户端消耗算力换取提交资格）
@@ -299,7 +374,7 @@ async def send_code(req: Request):
     if len(hits) >= IP_SEND_LIMIT:
         return fail(E_IP_LIMITED, "当前 IP 请求过于频繁，请一小时后再试")
     if now - _phone_last.get(phone, 0) < PHONE_COOLDOWN:
-        wait = int(PHONE_COOLDOWN - (now - _phone_last[phone]))
+        wait = ceil(PHONE_COOLDOWN - (now - _phone_last[phone]))
         return fail(
             E_PHONE_COOLDOWN,
             f"该手机号刚申请过验证码，请等待 {wait} 秒后再试（旧验证码可能仍有效）",
@@ -315,7 +390,7 @@ async def send_code(req: Request):
     state = {"client": None, "slot": slot, "closed": False, "processing": False}
     retained = False
     try:
-        # 一个流程只创建一个代理会话，任何失败明确返回，不自动换 IP 重试。
+        # 一个流程只创建一个代理会话；网络层有限重试沿用同一出口。
         client = TelegramWebClient(build_proxy(uuid.uuid4().hex[:12]))
         state["client"] = client
         random_hash = await client.send_code(phone)
@@ -330,10 +405,14 @@ async def send_code(req: Request):
         _bump("send_code_ok")
         return response
     except MyTelegramError as e:
+        if e.kind == "network" and e.request_not_sent:
+            _phone_last.pop(phone, None)
         _bump("send_code_fail", e.kind)
         return _tg_err(e)
     except Exception as e:
         print(f"[flow] send_code failed: {type(e).__name__}", flush=True)
+        if state["client"] is None:
+            _phone_last.pop(phone, None)
         _bump("send_code_fail", "unknown")
         return fail(E_TELEGRAM, "发送失败，请联系管理员检查服务配置或运行日志")
     finally:
@@ -344,7 +423,9 @@ async def send_code(req: Request):
 @app.post("/api/create-app")
 async def create_app(req: Request):
     await _cleanup_expired()
-    body = await req.json()
+    body = await _read_json_body(req)
+    if isinstance(body, JSONResponse):
+        return body
     request_id = str(body.get("request_id") or "").strip()
     state = _state.get(request_id)
     if not state:
@@ -370,7 +451,7 @@ async def create_app(req: Request):
             _bump("create_existed")
         return ok(
             {"api_id": result.api_id, "api_hash": result.api_hash, "existed": result.existed},
-            "申请成功",
+            "查询成功" if result.existed else "申请成功",
         )
     except MyTelegramError as e:
         _bump("create_fail", e.kind)
@@ -384,6 +465,7 @@ async def create_app(req: Request):
                     f"验证码已连续输错 {CODE_ATTEMPT_LIMIT} 次，为保护你的号码不被 Telegram 限流，"
                     "本次流程已作废。请等待几分钟后重新获取验证码，并仔细核对最新一条消息",
                     e.original,
+                    {"flow_closed": True},
                 )
             remaining = CODE_ATTEMPT_LIMIT - attempts
             retained = True
@@ -393,11 +475,11 @@ async def create_app(req: Request):
                 "请核对最新一条验证码消息，建议直接复制粘贴）",
                 e.original,
             )
-        return _tg_err(e)
+        return _tg_err(e, flow_closed=True)
     except Exception as e:
         print(f"[flow] create_app failed: {type(e).__name__}", flush=True)
         _bump("create_fail", "unknown")
-        return fail(E_TELEGRAM, "申请失败，本次流程已结束，请联系管理员检查运行日志")
+        return fail(E_TELEGRAM, "申请失败，本次流程已结束，请联系管理员检查运行日志", extra={"flow_closed": True})
     finally:
         if retained:
             state["processing"] = False
@@ -413,37 +495,97 @@ _FAIL_ZH = {
     "blocked": "被网站拦截",
     "telegram_error": "Telegram 拒绝",
     "phone_invalid": "手机号无效",
-    "state_expired": "流程过期",
-    "captcha": "人机验证未通过",
-    "ip_limited": "IP 限流",
-    "phone_cooldown": "手机号冷却中",
-    "busy": "系统繁忙",
     "unknown": "未知错误",
 }
+_SEND_FAILURE_KINDS = ("flood", "network", "phone_invalid", "blocked", "telegram_error", "unknown")
+_CREATE_FAILURE_KINDS = ("code_invalid", "flood", "network", "blocked", "telegram_error", "unknown")
+
+
+def _stats_data() -> dict:
+    """首页和刷新接口共用的汇总口径，不包含任何个人信息。"""
+    def zh(d: dict, kinds: tuple[str, ...]) -> dict:
+        return {_FAIL_ZH[k]: d.get(k, 0) for k in kinds}
+
+    total = _stats["create_ok"]
+    existing = _stats["create_existed"]
+    return {
+        "验证码发送成功": _stats["send_code_ok"],
+        "验证码发送失败": zh(_stats["send_code_fail"], _SEND_FAILURE_KINDS),
+        "申请成功": total - existing,
+        "查询成功": existing,
+        "成功合计": total,
+        "申请或查询失败": zh(_stats["create_fail"], _CREATE_FAILURE_KINDS),
+        "统计时段": "自服务启动以来（重启清零）",
+    }
 
 
 @app.get("/api/stats")
-async def stats(token: str = ""):
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
-        return JSONResponse({"code": 4040, "message": "not found", "data": {}}, status_code=404)
+async def stats():
+    return ok(_stats_data())
 
-    def zh(d: dict) -> dict:
-        return {_FAIL_ZH.get(k, k): v for k, v in d.items()}
 
-    data = {
-        "发码成功": _stats.get("send_code_ok", 0),
-        "发码失败": zh(_stats.get("send_code_fail", {})),
-        "申请成功": _stats.get("create_ok", 0),
-        "其中找回已有凭据": _stats.get("create_existed", 0),
-        "创建失败": zh(_stats.get("create_fail", {})),
-        "统计时段": "自服务启动以来（重启清零）",
-    }
-    return ok(data)
+def _stats_version() -> str:
+    return f"{_SERVER_INSTANCE}:{_stats_revision}"
+
+
+@app.get("/api/stats/events")
+async def stats_events(req: Request):
+    """首次同步快照，此后仅在汇总统计变化时推送；空闲时保活。"""
+    async def events():
+        seen = None
+        while not await req.is_disconnected():
+            revision = _stats_revision
+            if revision != seen:
+                seen = revision
+                payload = json.dumps(_stats_data(), ensure_ascii=False, separators=(",", ":"))
+                yield f"retry: 5000\nid: {_stats_version()}\ndata: {payload}\n\n"
+                continue
+            # 检查版本与登记等待之间没有 await，避免遗漏并发更新。
+            waiter = asyncio.get_running_loop().create_future()
+            _stats_waiters.add(waiter)
+            try:
+                await asyncio.wait_for(waiter, timeout=15)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+            finally:
+                _stats_waiters.discard(waiter)
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 @app.get("/")
 async def index():
-    return FileResponse(BASE_DIR / "static" / "index.html")
+    return HTMLResponse(_render_index(), headers={"Cache-Control": "no-store"})
+
+
+def _render_index() -> str:
+    """首屏直接包含真实统计，浏览器无需先绘制占位内容再发请求。"""
+    data = _stats_data()
+    def count(value: int) -> str:
+        return f"{value:,}"
+
+    def reasons(values: dict) -> str:
+        return "".join(
+            f'<li data-reason="{escape(reason, quote=True)}">{escape(reason)} · {count(value)} 次</li>'
+            for reason, value in values.items()
+        )
+
+    fields = {
+        "STATS_VERSION": _stats_version(),
+        "SERVER_INSTANCE": _SERVER_INSTANCE,
+        "STATS_NEW_OK": count(data["申请成功"]),
+        "STATS_EXISTED": count(data["查询成功"]),
+        "STATS_SEND_OK": count(data["验证码发送成功"]),
+        "STATS_SEND_FAIL": count(sum(data["验证码发送失败"].values())),
+        "STATS_CREATE_OK": count(data["成功合计"]),
+        "STATS_CREATE_FAIL": count(sum(data["申请或查询失败"].values())),
+        "STATS_SEND_REASONS": reasons(data["验证码发送失败"]),
+        "STATS_CREATE_REASONS": reasons(data["申请或查询失败"]),
+        "STATS_PERIOD": escape(data["统计时段"]),
+    }
+    template = (BASE_DIR / "static" / "index.html").read_text(encoding="utf-8")
+    return re.sub(r"\{\{([A-Z_]+)\}\}", lambda match: fields[match[1]], template)
 
 
 @app.get("/health")
@@ -462,4 +604,5 @@ async def sha256_lib():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=_int_env("PORT", 8000), workers=1, proxy_headers=False)
+    uvicorn.run(app, host="127.0.0.1", port=_int_env("PORT", 8000), workers=1,
+                proxy_headers=False, timeout_graceful_shutdown=15)

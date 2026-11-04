@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import uuid
@@ -18,9 +19,17 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from curl_cffi.requests import AsyncSession
+from curl_cffi.const import CurlECode
+from curl_cffi.requests.exceptions import RequestException
 
 BASE_URL = "https://my.telegram.org"
 TIMEOUT = 30
+# 只重试一次，沿用同一代理会话；POST 仅在尚未建立连接时重试。
+_CONNECT_ERRORS = frozenset({CurlECode.COULDNT_RESOLVE_PROXY, CurlECode.COULDNT_RESOLVE_HOST,
+                             CurlECode.COULDNT_CONNECT, CurlECode.SSL_CONNECT_ERROR})
+_READ_ERRORS = _CONNECT_ERRORS | {CurlECode.OPERATION_TIMEDOUT, CurlECode.GOT_NOTHING,
+                                 CurlECode.SEND_ERROR, CurlECode.RECV_ERROR,
+                                 CurlECode.HTTP2, CurlECode.HTTP2_STREAM, CurlECode.PARTIAL_FILE}
 
 
 class _AppPageParser(HTMLParser):
@@ -81,11 +90,12 @@ def redact_sensitive(text: str) -> str:
 class MyTelegramError(Exception):
     """统一业务错误。original 经脱敏后提供给前端和日志排查。"""
 
-    def __init__(self, kind: str, message: str, original: str = ""):
+    def __init__(self, kind: str, message: str, original: str = "", *, request_not_sent: bool = False):
         super().__init__(message)
         self.kind = kind
         self.message = message
         self.original = redact_sensitive(original)
+        self.request_not_sent = request_not_sent
 
 
 def normalize_phone(raw: str) -> str:
@@ -118,7 +128,7 @@ def _dump_debug_page(html: str, tag: str) -> None:
         masked = redact_sensitive(html)
         debug_dir = Path(__file__).parent / "debug_pages"
         debug_dir.mkdir(exist_ok=True)
-        stamp = time.strftime("%H%M%S")
+        stamp = str(time.time_ns()) + "_" + uuid.uuid4().hex[:8]
         (debug_dir / f"{stamp}_{tag}.html").write_text(masked, encoding="utf-8")
         print(f"[flow] 已存档解析失败页面 debug_pages/{stamp}_{tag}.html（已脱敏）", flush=True)
     except Exception as e:
@@ -138,14 +148,27 @@ class TelegramWebClient:
             "X-Requested-With": "XMLHttpRequest",
             **kw.pop("headers", {}),
         }
-        try:
-            resp = await self.session.request(
-                method, BASE_URL + path, headers=headers, timeout=TIMEOUT, **kw
-            )
-        except Exception as e:  # 网络层异常（代理断开、DNS、超时等）
-            raise MyTelegramError(
-                "network", "网络请求失败，请检查服务器网络或代理配置", repr(e)
-            ) from e
+        for attempt in range(2):
+            try:
+                resp = await self.session.request(
+                    method, BASE_URL + path, headers=headers, timeout=TIMEOUT,
+                    allow_redirects=(method == "GET"), **kw
+                )
+                break
+            except RequestException as e:
+                retryable = e.code in (_READ_ERRORS if method == "GET" else _CONNECT_ERRORS)
+                if attempt == 0 and retryable:
+                    await asyncio.sleep(1)
+                    continue
+                message = "网络请求失败，请联系管理员检查服务器网络或代理配置"
+                if attempt:
+                    message = "网络请求失败，已自动重试一次，请稍后再试或联系管理员"
+                if method == "POST" and e.code not in _CONNECT_ERRORS:
+                    message = ("验证码发送结果未能确认，请先查看 Telegram 消息，暂勿重复发送"
+                               if path == "/auth/send_password" else
+                               "操作结果未能确认，为避免重复提交，本次流程已结束，请稍后再试")
+                raise MyTelegramError("network", message, f"curl={int(e.code)}; {type(e).__name__}",
+                                      request_not_sent=e.code in _CONNECT_ERRORS) from e
         body = resp.text or ""
         if resp.status_code in (403, 503, 429) or "Just a moment" in body[:2000]:
             raise MyTelegramError(
@@ -155,20 +178,14 @@ class TelegramWebClient:
             )
         return resp
 
-    async def log_exit_ip(self, step: str) -> None:
-        """诊断用：记录当前流程该步骤的代理出口 IP（验证流程内 IP 是否漂移）。"""
-        try:
-            resp = await self.session.get(
-                "https://api.ipify.org?format=json", timeout=15
-            )
-            print(f"[flow] step={step} exit_ip={resp.text.strip()}", flush=True)
-        except Exception as e:
-            print(f"[flow] step={step} exit_ip=unknown ({type(e).__name__})", flush=True)
-
     # ---- 第 1 步：发送验证码 ----
     async def send_code(self, phone: str) -> str:
-        await self.log_exit_ip("send_code")
-        await self._request("GET", "/")  # 建立基础 cookie
+        try:
+            await self._request("GET", "/")  # 建立基础 cookie
+        except MyTelegramError as e:
+            if e.kind == "network":
+                e.request_not_sent = True  # 还未调用验证码发送接口。
+            raise
         resp = await self._request("POST", "/auth/send_password", data={"phone": phone})
         try:
             payload = resp.json()
@@ -195,7 +212,6 @@ class TelegramWebClient:
 
     # ---- 第 2 步：验证码登录 ----
     async def login(self, phone: str, random_hash: str, code: str) -> None:
-        await self.log_exit_ip("login")
         # 注意：/auth/login 的表单字段名是 "password"（值为收到的登录验证码），不是 "code"
         resp = await self._request(
             "POST",
