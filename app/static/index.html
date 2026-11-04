@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0a0a0a">
+<meta name="description" content="Telegram API 凭据自助申请：填写手机号和 Telegram 验证码，申请或查询 api_id / api_hash">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230a0a0a'/><text x='50' y='66' font-size='44' fill='white' text-anchor='middle' font-family='system-ui'>T</text></svg>">
+<script src="/sha256.min.js"></script>
+<title>Telegram API 凭据自助申请</title>
+<style>
+  /* ===== 设计变量 · Minimal Premium（Vercel/Linear 式）===== */
+  :root {
+    --bg: #fafafa;
+    --card: #ffffff;
+    --border: #e4e4e7;
+    --border-strong: #d4d4d8;
+    --text: #09090b;
+    --muted: #71717a;
+    --faint: #a1a1aa;
+    --accent: #0a0a0a;
+    --accent-hover: #27272a;
+    --err: #dc2626;
+    --err-bg: #fef2f2;
+    --err-line: #fecaca;
+    --radius: 10px;
+    --control-h: 44px;  /* 触控目标标准线 */
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 72px 16px;
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { width: 100%; max-width: 400px; }
+
+  /* ===== 页头 ===== */
+  .page-head { margin-bottom: 28px; }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; margin-bottom: 6px; }
+  .sub { color: var(--muted); font-size: 14px; }
+
+  /* ===== 卡片：发丝边框 + 极淡阴影 ===== */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 14px;
+    animation: fadeIn .25s ease;
+  }
+
+  /* ===== 使用须知：融入页面，不抢戏 ===== */
+  .notice { padding: 16px 18px; }
+  .notice-title { display: block; font-size: 12px; font-weight: 600; letter-spacing: .06em; color: var(--muted); margin-bottom: 8px; }
+  .notice ol { padding-left: 18px; font-size: 13px; line-height: 1.85; color: var(--muted); }
+  .notice b { color: var(--text); font-weight: 500; }
+  .notice a { color: var(--text); text-decoration: underline; text-underline-offset: 2px; }
+  .notice a:hover { color: var(--muted); }
+
+  /* ===== 表单控件 ===== */
+  .field-label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; }
+  .step-label { color: var(--faint); font-weight: 400; margin-right: 6px; }
+  input {
+    width: 100%;
+    min-height: var(--control-h);
+    padding: 9px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    font-size: 15px;
+    outline: none;
+    transition: border-color .15s, box-shadow .15s;
+    background: #fff;
+    color: var(--text);
+  }
+  input::placeholder { color: var(--faint); }
+  input:focus { border-color: var(--text); box-shadow: 0 0 0 3px rgba(9, 9, 11, .08); }
+  .btn {
+    width: 100%;
+    min-height: var(--control-h);
+    margin-top: 12px;
+    padding: 10px;
+    border: none;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s, transform .1s;
+  }
+  .btn:hover { background: var(--accent-hover); }
+  .btn:active { transform: scale(.99); }
+  .btn:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+  .btn[disabled] { opacity: .5; cursor: not-allowed; }
+  input:focus-visible { outline: none; }
+  .btn.secondary {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
+  .btn.secondary:hover { background: #f4f4f5; color: var(--text); }
+  .hint { font-size: 12.5px; color: var(--faint); margin-top: 10px; line-height: 1.7; }
+  .hint b { color: var(--muted); font-weight: 500; }
+  /* PoW 提示行：固定紧凑高度，消除布局偏移（CLS）又不留大空隙 */
+  .cf-wrap { margin-top: 10px; height: 22px; display: flex; align-items: center; font-size: 12.5px; color: var(--muted); }
+
+  /* ===== 错误提示 ===== */
+  .error {
+    display: none;
+    background: var(--err-bg);
+    color: var(--err);
+    border: 1px solid var(--err-line);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    margin-bottom: 14px;
+    line-height: 1.7;
+    word-break: break-all;
+    animation: fadeIn .2s ease;
+  }
+
+  /* ===== 结果 ===== */
+  .ok-badge { color: var(--text); font-weight: 600; font-size: 15px; }
+  .existed-tag { font-size: 13px; color: var(--muted); }
+  .result .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-top: 10px;
+  }
+  .result .k { font-size: 12px; color: var(--muted); white-space: nowrap; min-width: 62px; }
+  .result .v { font-size: 13px; font-weight: 500; word-break: break-all; flex: 1; }
+  .copy {
+    border: 1px solid var(--border);
+    background: #fff;
+    color: var(--text);
+    font-size: 12px;
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    min-height: 30px;
+    transition: background .15s;
+  }
+  .copy:hover { background: #f4f4f5; }
+  .warn {
+    border-top: 1px dashed var(--border);
+    margin-top: 14px;
+    padding-top: 12px;
+    font-size: 12.5px;
+    color: var(--muted);
+    line-height: 1.7;
+  }
+  .warn b { color: var(--text); font-weight: 500; }
+
+  footer { text-align: center; color: var(--faint); font-size: 12px; margin-top: 24px; line-height: 1.8; padding: 0 8px; }
+  .tg-links { display: flex; justify-content: center; gap: 18px; margin-top: 16px; }
+  .tg-links a { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; text-decoration: none; border-bottom: 1px dashed var(--border-strong); padding-bottom: 2px; transition: color .15s, border-color .15s; }
+  .tg-links a:hover { color: var(--text); border-bottom-color: var(--muted); }
+  .tg-links svg { width: 14px; height: 14px; flex: none; }
+  .hidden { display: none !important; }
+
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+
+  /* 动画无障碍：系统开启"减少动态效果"时禁用过渡动画 */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+
+  /* ===== 手机端 ===== */
+  @media (max-width: 480px) {
+    body { padding: 36px 14px; }
+    .page-head { margin-bottom: 20px; }
+    .card { padding: 16px; }
+  }
+  @media (min-width: 768px) {
+    body { padding: 96px 24px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="page-head">
+    <h1>Telegram API 凭据自助申请</h1>
+    <p class="sub">填写手机号和验证码，申请或查询 api_id / api_hash</p>
+  </header>
+
+  <div id="error" class="error" role="alert" aria-live="polite"></div>
+
+  <!-- 使用须知（始终展开） -->
+  <div class="card notice">
+    <span class="notice-title">使用须知</span>
+    <ol>
+      <li>验证码发在 <b>Telegram App</b> 内（官方「Telegram」账号的消息），<b>不是短信</b></li>
+      <li>如提示「请求过于频繁」，请停止连续尝试，按提示等待后再试；Telegram 未承诺固定恢复时间</li>
+      <li>收到验证码后直接<b>复制粘贴</b>，避免手动输入出错</li>
+      <li>搞不定？联系管理员 TG：<a href="https://t.me/HengteGo" target="_blank" rel="noopener">@HengteGo</a></li>
+    </ol>
+  </div>
+
+  <!-- 第 1 步 -->
+  <div class="card" id="step1">
+    <label class="field-label" for="phone"><span class="step-label">第 1 步 ·</span>手机号</label>
+    <input id="phone" type="tel" placeholder="+14155550132" autocomplete="tel" maxlength="16" inputmode="tel">
+    <div id="powHint" class="cf-wrap" aria-live="polite"></div>
+    <button class="btn" id="sendBtn" onclick="sendCode()">获取验证码</button>
+    <p class="hint">填写国际格式手机号（含国家区号和 + 号）。</p>
+  </div>
+
+  <!-- 第 2 步 -->
+  <div class="card hidden" id="step2">
+    <label class="field-label" for="code"><span class="step-label">第 2 步 ·</span>登录验证码</label>
+    <input id="code" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="4096" placeholder="粘贴验证码或包含验证码的完整消息">
+    <button class="btn" id="applyBtn" onclick="createApp()">一键申请</button>
+    <button class="btn secondary" onclick="reset()">返回手机号填写页</button>
+    <p class="hint">验证码在 Telegram 官方账号「Telegram」的服务消息里，<b>不是短信</b>。可粘贴验证码或含验证码的完整消息。提交后请等待结果，处理时间取决于网络和 Telegram 响应。</p>
+  </div>
+
+  <!-- 结果 -->
+  <div class="card result hidden" id="result">
+    <p><span class="ok-badge">✓ 申请成功</span>&nbsp;<span id="existedTag" class="existed-tag"></span></p>
+    <div class="row"><span class="k">api_id</span><span class="v" id="apiId"></span><button class="copy" onclick="copyVal('apiId', this)">复制</button></div>
+    <div class="row"><span class="k">api_hash</span><span class="v" id="apiHash"></span><button class="copy" onclick="copyVal('apiHash', this)">复制</button></div>
+    <div class="warn">请<b>立即保存</b>上面两项凭据（本页面刷新后不再显示）。每个号码只能创建一个应用；之后再查询需要重新登录 my.telegram.org。</div>
+    <button class="btn secondary" onclick="downloadCreds()">下载凭据文件（.txt）</button>
+    <button class="btn secondary" onclick="reset(true)">为其他号码申请</button>
+  </div>
+
+  <div class="tg-links">
+    <a href="https://t.me/LongQingHQ" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 11 18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg>Telegram 频道</a>
+    <a href="https://t.me/LongQingClub" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>Telegram 社群</a>
+  </div>
+
+  <footer>手机号会保存在当前浏览器，申请状态保存在当前标签页；可清除网站数据删除。结果凭据不自动持久保存，下载文件由你自行保管。<br>服务端临时处理登录会话，解析失败时保存脱敏页面用于排查。请遵守 <a href="https://core.telegram.org/api/terms" target="_blank" rel="noopener">Telegram API 服务条款</a>。</footer>
+</div>
+
+<script>
+let requestId = null;
+let requestExpiresAt = 0;
+let sending = false;
+let applying = false;
+const $ = id => document.getElementById(id);
+
+function showError(msg) { const el = $('error'); el.style.display = 'block'; el.textContent = msg; }
+function hideError() { $('error').style.display = 'none'; }
+
+// 统一响应包络：{code, message, data}，code=0 为成功
+async function api(path, body) {
+  const resp = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) throw new Error(`服务请求失败（HTTP ${resp.status}）`);
+  const env = await resp.json();
+  if (env.code !== 0) {
+    const err = new Error(env.message || '请求失败');
+    err.code = env.code;
+    err.data = env.data || {};
+    throw err;
+  }
+  return env.data;
+}
+
+function setBusy(btn, busy, busyText) {
+  if (busy) { btn.dataset.text = btn.textContent; btn.textContent = busyText; btn.disabled = true; }
+  else { btn.textContent = btn.dataset.text || btn.textContent; btn.disabled = false; }
+}
+
+// ---- PoW 工作量证明人机验证（零注册、自托管）----
+// 第一阶段计算挑战，完成后获得提交资格；缓存到服务端给出的 expires_at 为止。
+let pow = null;  // {challenge_id, salt, challenge, maxnumber, nonce(found), solving}
+let powGeneration = 0;
+
+async function newPowChallenge() {
+  const generation = ++powGeneration;
+  pow = null;
+  try { sessionStorage.removeItem('tg_pow'); } catch (e) { /* 忽略 */ }
+  $('powHint').textContent = '正在准备人机验证…';
+  $('sendBtn').disabled = true;
+  $('phone').disabled = true;  // 人机验证就绪前锁定输入
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);  // 弱网 8 秒超时，不再无声卡住
+  try {
+    const resp = await fetch('/api/pow', { signal: ctrl.signal });
+    clearTimeout(timer);
+    const env = await resp.json();
+    if (generation !== powGeneration) return;
+    if (env.code !== 0) throw new Error(env.message);
+    pow = { ...env.data, nonce: -1, solving: false };
+    solvePow(pow, generation);
+  } catch (e) {
+    clearTimeout(timer);
+    if (generation !== powGeneration) return;
+    $('powHint').textContent = `人机验证初始化失败：${e.name === 'AbortError' ? '请求超时，请检查网络后刷新页面' : e.message}`;
+  }
+}
+
+async function solvePow(challenge, generation) {
+  if (typeof sha256 !== 'function') {
+    $('powHint').textContent = '验证组件加载失败，请刷新页面重试';
+    return;
+  }
+  challenge.solving = true;
+  $('powHint').textContent = '正在进行人机验证…';
+  const target = challenge.challenge;
+  const BATCH = 20000;
+  try {
+    for (let n = 0; n < challenge.maxnumber; n += BATCH) {
+      if (generation !== powGeneration) return;
+      const end = Math.min(n + BATCH, challenge.maxnumber);
+      for (let i = n; i < end; i++) {
+        if (sha256(challenge.salt + i) === target) {
+          challenge.nonce = i;
+          challenge.solving = false;
+          $('powHint').textContent = '✓ 人机验证已就绪';
+          $('phone').disabled = false;  // 就绪后解锁输入
+          $('sendBtn').disabled = false;
+          // 按服务端返回的有效期恢复，避免与 POW_TTL 配置分叉。
+          try {
+            sessionStorage.setItem('tg_pow', JSON.stringify(challenge));
+          } catch (e) { /* 忽略 */ }
+          return;
+        }
+      }
+      $('powHint').textContent = `正在进行人机验证 ${Math.round(end / challenge.maxnumber * 100)}%`;
+      await new Promise(r => setTimeout(r, 0));  // 让出主线程，保持页面流畅
+    }
+    challenge.solving = false;
+    $('powHint').textContent = '验证计算异常，请刷新页面重试';
+  } catch (err) {
+    if (generation !== powGeneration) return;
+    challenge.solving = false;
+    $('powHint').textContent = '验证计算出错，请刷新页面重试';
+  }
+}
+
+async function sendCode() {
+  if (sending) return;
+  hideError();
+  const phone = $('phone').value.trim();
+  if (!phone) return showError('请先填写手机号');
+  if (!pow || pow.nonce < 0) {
+    showError(pow && pow.solving ? '人机验证计算中，请稍候一两秒再点' : '人机验证未就绪，请刷新页面重试');
+    return;
+  }
+  hideError();
+  sending = true;
+  setBusy($('sendBtn'), true, '发送中…');
+  // 给用户等待预期，减少重复操作。
+  const slowHint = setTimeout(() => {
+    if ($('sendBtn').disabled) $('sendBtn').textContent = '仍在连接，请稍候…';
+  }, 5000);
+  try {
+    const data = await api('/api/send-code', {
+      phone,
+      challenge_id: pow.challenge_id,
+      nonce: pow.nonce,
+    });
+    requestId = data.request_id;
+    requestExpiresAt = data.expires_at;
+    saveFlow(2);
+    $('step1').classList.add('hidden');
+    $('step2').classList.remove('hidden');
+    $('code').focus();
+  } catch (e) {
+    if (e.code === 1002) {
+      showError('人机验证已过期，正在自动重新计算，请稍候再点一次');
+    } else {
+      showError(e.message || '发送失败，请稍后再试');
+    }
+  } finally {
+    clearTimeout(slowHint);
+    setBusy($('sendBtn'), false);
+    sending = false;
+    pow = null;
+    try { sessionStorage.removeItem('tg_pow'); } catch (e) { /* 忽略 */ }
+    // 第二步无需 PoW，只在仍处于第一步时重新取题。
+    if (!requestId) newPowChallenge();
+  }
+}
+function savePhone() {
+  try { localStorage.setItem('tg_phone', $('phone').value.trim()); } catch (e) { /* 隐私模式忽略 */ }
+}
+function saveFlow(step) {
+  try {
+    if (step) sessionStorage.setItem('tg_flow', JSON.stringify({ request_id: requestId, expires_at: requestExpiresAt, step }));
+    else sessionStorage.removeItem('tg_flow');
+  } catch (e) { /* 忽略 */ }
+}
+function restoreOnLoad() {
+  let restored = false;
+  try {
+    const phone = localStorage.getItem('tg_phone');
+    if (phone) $('phone').value = phone;
+    const flow = JSON.parse(sessionStorage.getItem('tg_flow') || 'null');
+    if (flow && flow.request_id && flow.step === 2 && Date.now() < flow.expires_at * 1000) {
+      requestId = flow.request_id;
+      requestExpiresAt = flow.expires_at;
+      $('step1').classList.add('hidden');
+      $('step2').classList.remove('hidden');
+      restored = true;
+    } else {
+      sessionStorage.removeItem('tg_flow');
+    }
+  } catch (e) { /* 忽略 */ }
+  return restored;  // true = 已恢复到第 2 步（此步无需 PoW，跳过初始化）
+}
+
+async function createApp() {
+  if (applying) return;
+  hideError();
+  const code = $('code').value.trim();
+  if (!code) return showError('请输入验证码');
+  applying = true;
+  setBusy($('applyBtn'), true, '申请中…');
+  try {
+    const data = await api('/api/create-app', { request_id: requestId, code });
+    saveFlow(null);  // 流程结束，清除恢复状态
+    $('existedTag').textContent = data.existed ? '（该号码此前已创建过，以下为已有凭据）' : '';
+    $('apiId').textContent = data.api_id;
+    $('apiHash').textContent = data.api_hash;
+    $('step2').classList.add('hidden');
+    $('result').classList.remove('hidden');
+  } catch (e) {
+    // 英文原文只进控制台供排查，用户只看中文提示
+    if (e.data && e.data.original) console.error('[server]', e.data.original);
+    const msg = e.message || '申请失败，请稍后再试';
+    if (e.code === 2002) { $('code').value = ''; $('code').focus(); }
+    if (e.code === 2003) { applying = false; reset(); showError(msg); return; }
+    showError(msg);
+  } finally { applying = false; setBusy($('applyBtn'), false); }
+}
+
+function reset(clearPhone) {
+  if (sending || applying) return;
+  requestId = null;
+  requestExpiresAt = 0;
+  $('code').value = '';
+  saveFlow(null);
+  if (clearPhone) {
+    $('phone').value = '';
+    try { localStorage.removeItem('tg_phone'); } catch (e) { /* 忽略 */ }
+  }
+  $('step2').classList.add('hidden');
+  $('result').classList.add('hidden');
+  $('step1').classList.remove('hidden');
+  hideError();
+  newPowChallenge();
+}
+
+function copyVal(id, btn) {
+  const text = $(id).textContent;
+  const flash = () => {
+    if (!btn) return;
+    const old = btn.textContent;
+    btn.textContent = '已复制';
+    btn.disabled = true;
+    setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 1200);
+  };
+  if (!navigator.clipboard || !window.isSecureContext) {
+    showError('复制需要 HTTPS，请手动选择凭据复制或下载凭据文件');
+    return;
+  }
+  navigator.clipboard.writeText(text)
+    .then(flash)
+    .catch(() => showError('复制失败，请检查浏览器剪贴板权限'));
+}
+
+function downloadCreds() {
+  const text = [
+    'Telegram API 凭据',
+    'api_id: ' + $('apiId').textContent,
+    'api_hash: ' + $('apiHash').textContent,
+    '时间: ' + new Date().toLocaleString(),
+  ].join('\n') + '\n';
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'telegram_api_credentials.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// 手机号限制格式；验证码保留粘贴原文，由后端统一提取。
+$('phone').addEventListener('input', e => {
+  const cleaned = e.target.value.replace(/[^\d+]/g, '').replace(/(?!^)\+/g, '');
+  if (e.target.value !== cleaned) e.target.value = cleaned;
+  savePhone();
+});
+$('code').addEventListener('keydown', e => { if (e.key === 'Enter') createApp(); });
+$('phone').addEventListener('keydown', e => { if (e.key === 'Enter') sendCode(); });
+// 初始化：优先恢复未使用的 PoW 结果（刷新不再从 0 重算），第 2 步恢复则跳过
+(function init() {
+  if (restoreOnLoad()) return;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem('tg_pow') || 'null');
+    if (saved && saved.nonce >= 0 && Date.now() < saved.expires_at * 1000) {
+      pow = saved;
+      pow.solving = false;
+      $('powHint').textContent = '✓ 人机验证已就绪';
+      $('phone').disabled = false;
+      $('sendBtn').disabled = false;
+      return;
+    }
+  } catch (e) { /* 忽略 */ }
+  newPowChallenge();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+# 跨平台换行符统一规范
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.html text eol=lf
+*.js text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+.env.example text eol=lf
+*.png binary
+*.exe binary
+*.7z binary

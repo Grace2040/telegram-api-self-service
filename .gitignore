@@ -1,0 +1,8 @@
+.env
+__pycache__/
+.venv/
+*.pyc
+debug_pages/
+scripts/
+_page.html
+_oauth*
