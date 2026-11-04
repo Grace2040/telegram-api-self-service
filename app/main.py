@@ -29,7 +29,7 @@ from mytelegram import MyTelegramError, TelegramWebClient, normalize_phone
 
 BASE_DIR = Path(__file__).parent             # app/ 目录（代码与静态资源）
 PROJECT_ROOT = Path(__file__).parent.parent  # 项目根目录（.env 所在）
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 _MAX_REQUEST_BODY = 16 * 1024
 
 

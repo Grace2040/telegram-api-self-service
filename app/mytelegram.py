@@ -145,7 +145,7 @@ class TelegramWebClient:
     async def _request(self, method: str, path: str, **kw):
         headers = {
             "Referer": BASE_URL + "/",
-            "X-Requested-With": "XMLHttpRequest",
+            **({"X-Requested-With": "XMLHttpRequest"} if method == "POST" else {}),
             **kw.pop("headers", {}),
         }
         for attempt in range(2):
