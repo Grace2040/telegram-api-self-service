@@ -1,4 +1,4 @@
-"""Telegram API 凭据自助申请服务 — FastAPI 入口。
+"""Telegram API 凭据自助申请系统 — FastAPI 入口。
 
 安全与防滥用：PoW 工作量证明人机验证（防脚本轰炸）、每 IP 限流、
 每手机号冷却、全局并发上限、统一响应包络 + 错误码表、首页公开汇总统计。
@@ -29,7 +29,7 @@ from mytelegram import MyTelegramError, TelegramWebClient, normalize_phone
 
 BASE_DIR = Path(__file__).parent             # app/ 目录（代码与静态资源）
 PROJECT_ROOT = Path(__file__).parent.parent  # 项目根目录（.env 所在）
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 _MAX_REQUEST_BODY = 16 * 1024
 
 
@@ -104,8 +104,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Telegram API 凭据自助申请",
-    description="自动化完成 my.telegram.org 创建应用流程，代用户获取 api_id / api_hash",
+    title="Telegram API 凭据自助申请系统",
+    description="通过网页申请或查询 Telegram 的 api_id 和 api_hash",
     version=VERSION,
     lifespan=lifespan,
     docs_url="/docs" if ENABLE_DOCS else None,
