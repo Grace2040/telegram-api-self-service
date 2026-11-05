@@ -190,6 +190,8 @@ document.documentElement.dataset.powReady = initialPow ? 'true' : 'false';
   .stats-existing strong { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
   .stats-failures { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 14px; }
   .stats-failures h3 { font-size: 12px; font-weight: 500; margin-bottom: 5px; }
+  .stats-stage-summary { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .stats-stage-summary strong { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
   .stats-failures ul { list-style: none; font-size: 12px; color: var(--muted); line-height: 1.9; min-height: 11.4em; overflow-wrap: anywhere; }
   .stats-failures section + section { margin-top: 12px; }
   .stats-meta { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 14px; font-size: 11px; color: var(--faint); line-height: 1.8; }
@@ -282,20 +284,19 @@ document.documentElement.dataset.powReady = initialPow ? 'true' : 'false';
       <h2 id="statsTitle">服务统计</h2>
     </div>
     <div class="stats-grid">
+      <div class="stat-item"><span class="stat-label">总成功</span><output class="stat-value" id="statsTotalOk">{{STATS_TOTAL_OK}}</output></div>
+      <div class="stat-item"><span class="stat-label">总失败</span><output class="stat-value" id="statsTotalFail">{{STATS_TOTAL_FAIL}}</output></div>
       <div class="stat-item"><span class="stat-label">申请成功</span><output class="stat-value" id="statsNewOk">{{STATS_NEW_OK}}</output></div>
       <div class="stat-item"><span class="stat-label">查询成功</span><output class="stat-value" id="statsExisted">{{STATS_EXISTED}}</output></div>
-      <div class="stat-item"><span class="stat-label">验证码发送成功</span><output class="stat-value" id="statsSendOk">{{STATS_SEND_OK}}</output></div>
-      <div class="stat-item"><span class="stat-label">验证码发送失败</span><output class="stat-value" id="statsSendFail">{{STATS_SEND_FAIL}}</output></div>
     </div>
-    <p class="stats-existing">成功合计 <strong id="statsCreateOk">{{STATS_CREATE_OK}}</strong> 次 · 申请或查询失败 <strong id="statsCreateFail">{{STATS_CREATE_FAIL}}</strong> 次</p>
-    <p class="stats-existing">申请：创建新凭据；查询：读取已有凭据。<br>验证码发送成功不代表申请成功。</p>
+    <p class="stats-existing">拿到新凭据计为申请成功，读取已有凭据计为查询成功。<br>验证码发送成功不计入总成功；失败按请求次数累计。</p>
     <div class="stats-failures">
-      <section><h3>验证码发送失败原因</h3><ul id="statsSendReasons">{{STATS_SEND_REASONS}}</ul></section>
-      <section><h3>申请或查询失败原因</h3><ul id="statsCreateReasons">{{STATS_CREATE_REASONS}}</ul></section>
+      <section><h3>验证码发送失败原因</h3><p class="stats-stage-summary">发送成功 <strong id="statsSendOk">{{STATS_SEND_OK}}</strong> 次 · 发送失败 <strong id="statsSendFail">{{STATS_SEND_FAIL}}</strong> 次</p><ul id="statsSendReasons">{{STATS_SEND_REASONS}}</ul></section>
+      <section><h3>申请或查询失败原因</h3><p class="stats-stage-summary">失败 <strong id="statsCreateFail">{{STATS_CREATE_FAIL}}</strong> 次</p><ul id="statsCreateReasons">{{STATS_CREATE_REASONS}}</ul></section>
     </div>
     <div class="stats-meta">
       <p id="statsPeriod">{{STATS_PERIOD}}</p>
-      <p class="stats-status" id="statsStatus" role="status" aria-live="polite">统计已更新</p>
+      <p class="stats-status" id="statsStatus" role="status" aria-live="polite">实时同步</p>
     </div>
   </section>
 
@@ -323,7 +324,7 @@ let statsSource = null;
 
 function renderStats(data) {
   const validCount = value => Number.isSafeInteger(value) && value >= 0;
-  for (const key of ['验证码发送成功', '申请成功', '查询成功', '成功合计']) {
+  for (const key of ['验证码发送成功', '申请成功', '查询成功', '总成功', '总失败']) {
     if (!validCount(data[key])) throw new Error('统计数据格式异常');
   }
   const failureTotal = failures => {
@@ -332,9 +333,10 @@ function renderStats(data) {
     if (!values.every(validCount)) throw new Error('统计数据格式异常');
     return values.reduce((sum, value) => sum + value, 0);
   };
-  if (data['申请成功'] + data['查询成功'] !== data['成功合计']) throw new Error('统计数据格式异常');
+  if (data['申请成功'] + data['查询成功'] !== data['总成功']) throw new Error('统计数据格式异常');
   const sendFailures = failureTotal(data['验证码发送失败']);
   const createFailures = failureTotal(data['申请或查询失败']);
+  if (sendFailures + createFailures !== data['总失败']) throw new Error('统计数据格式异常');
   if (typeof data['统计时段'] !== 'string') throw new Error('统计数据格式异常');
   const format = value => value.toLocaleString('zh-CN');
   const renderReasons = (id, failures) => {
@@ -356,7 +358,8 @@ function renderStats(data) {
   setText($('statsSendOk'), format(data['验证码发送成功']));
   setText($('statsSendFail'), format(sendFailures));
   setText($('statsNewOk'), format(data['申请成功']));
-  setText($('statsCreateOk'), format(data['成功合计']));
+  setText($('statsTotalOk'), format(data['总成功']));
+  setText($('statsTotalFail'), format(data['总失败']));
   setText($('statsCreateFail'), format(createFailures));
   setText($('statsExisted'), format(data['查询成功']));
   setText($('statsPeriod'), data['统计时段']);
@@ -380,13 +383,13 @@ function connectStats() {
       if (!event.lastEventId) throw new Error('缺少统计版本');
       renderStats(JSON.parse(event.data));
       statsVersion = event.lastEventId;
-      statsStatus('统计已更新', false);
+      statsStatus('实时同步', false);
     } catch {
       statsStatus('统计数据异常，请联系管理员。', true);
     }
   };
   statsSource.onopen = () => {
-    if ($('statsStatus').dataset.error === 'true') statsStatus('统计已更新', false);
+    if ($('statsStatus').dataset.error === 'true') statsStatus('实时同步', false);
   };
   statsSource.onerror = () => statsStatus('统计连接暂时中断，正在重新连接。', true);
 }
@@ -422,7 +425,7 @@ async function api(path, body) {
   if (!resp.ok) throw new Error(`服务请求失败（HTTP ${resp.status}）`);
   const env = await resp.json();
   if (env.code !== 0) {
-    const err = new Error(env.message || '请求失败');
+    const err = new Error((env.message || '请求失败') + (env.data && env.data.stats_warning ? '；' + env.data.stats_warning : ''));
     err.code = env.code;
     err.data = env.data || {};
     throw err;
@@ -542,6 +545,7 @@ async function sendCode() {
     $('step2').classList.remove('hidden');
     moveFeedback('step2');
     $('code').focus();
+    if (data.stats_warning) { showError(data.stats_warning); statsStatus('统计保存失败，请联系管理员。', true); }
   } catch (e) {
     if (e.code === 1002) {
       showError('人机验证已过期，正在自动重新计算，请稍候再点一次');
@@ -604,6 +608,7 @@ async function createApp() {
     $('step2').classList.add('hidden');
     $('result').classList.remove('hidden');
     moveFeedback('result');
+    if (data.stats_warning) { showError(data.stats_warning); statsStatus('统计保存失败，请联系管理员。', true); }
   } catch (e) {
     // 英文原文只进控制台供排查，用户只看中文提示
     if (e.data && e.data.original) console.error('[server]', e.data.original);

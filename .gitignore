@@ -15,5 +15,10 @@ scripts/
 # 开发测试仅保存在本地
 /tests/
 /docs/dependencies.json
+/data/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 _page.html
 _oauth*

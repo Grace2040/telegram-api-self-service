@@ -13,11 +13,13 @@ import json
 import os
 import random
 import re
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
 from html import escape
 from math import ceil
+from functools import wraps
 from pathlib import Path
 from urllib.parse import quote
 
@@ -26,10 +28,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from mytelegram import MyTelegramError, TelegramWebClient, normalize_phone
+from stats_store import StatsStore, SEND_FAILURE_KINDS, CREATE_FAILURE_KINDS
 
 BASE_DIR = Path(__file__).parent             # app/ 目录（代码与静态资源）
 PROJECT_ROOT = Path(__file__).parent.parent  # 项目根目录（.env 所在）
-VERSION = "0.2.3"
+VERSION = "0.3.0"
 _MAX_REQUEST_BODY = 16 * 1024
 
 
@@ -46,6 +49,8 @@ def _load_env() -> None:
 
 
 _load_env()
+_stats_path = Path(os.getenv("STATS_DB_PATH", "data/statistics.sqlite3").strip() or "data/statistics.sqlite3")
+STATS_DB_PATH = _stats_path if _stats_path.is_absolute() else PROJECT_ROOT / _stats_path
 
 # 运行参数：全部可由 .env 覆盖，不填使用默认值
 TTL_SECONDS = _int_env("TTL_SECONDS", 10 * 60)  # 申请流程状态有效期（秒）
@@ -82,6 +87,8 @@ POW_POOL_LIMIT = _int_env("POW_POOL_LIMIT", 8000)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _stats_store
+    _stats_store = StatsStore(STATS_DB_PATH)
     stop = asyncio.Event()
 
     async def maintain():
@@ -132,14 +139,16 @@ def ok(data: dict | None = None, message: str = "ok") -> JSONResponse:
     return JSONResponse({"code": 0, "message": message, "data": data or {}}, headers={"Cache-Control": "no-store"})
 
 
-def fail(code: int, message: str, original: str = "", extra: dict | None = None) -> JSONResponse:
+def fail(code: int, message: str, original: str = "", extra: dict | None = None, *, stats_kind: str | None = None) -> JSONResponse:
     data = dict(extra or {})
     if original:
         data["original"] = original
     if code == E_TELEGRAM:
         # 诊断日志：只记录 Telegram 返回的响应内容，不记录手机号/验证码等用户输入
         print(f"[mytelegram] code={code} original={original[:200]}", flush=True)
-    return JSONResponse({"code": code, "message": message, "data": data}, headers={"Cache-Control": "no-store"})
+    response = JSONResponse({"code": code, "message": message, "data": data}, headers={"Cache-Control": "no-store"})
+    response.stats_kind = stats_kind
+    return response
 
 
 async def _read_json_body(req: Request) -> dict | JSONResponse:
@@ -176,29 +185,51 @@ _pow_ip_hits: dict[str, list[float]] = {}
 _ip_hits: dict[str, list[float]] = {}
 _phone_last: dict[str, float] = {}
 
-# 统计打点
-_stats: dict = {
-    "send_code_ok": 0,
-    "send_code_fail": {},
-    "create_ok": 0,
-    "create_existed": 0,
-    "create_fail": {},
-}
+# 统计只写入 SQLite；内存仅保留实时推送版本与等待连接。
+_stats_store: StatsStore | None = None
 _stats_revision = 0
 _stats_waiters: set[asyncio.Future] = set()
 
 
-def _bump(bucket: str, kind: str = "ok") -> None:
+def _record_stats(stage: str, *, success: bool, kind: str = "unknown", existed: bool = False) -> None:
     global _stats_revision
-    if kind == "ok":
-        _stats[bucket] = _stats.get(bucket, 0) + 1
-    else:
-        fails = _stats.setdefault(bucket, {})
-        fails[kind] = fails.get(kind, 0) + 1
+    if _stats_store is None:
+        raise RuntimeError("统计存储尚未初始化")
+    _stats_store.record(stage, success=success, kind=kind, existed=existed)
     _stats_revision += 1
     for waiter in tuple(_stats_waiters):
         if not waiter.done():
             waiter.set_result(None)
+
+
+_FAILURE_KIND_BY_CODE = {
+    E_REQUEST_INVALID: "request_invalid", E_PHONE_INVALID: "phone_invalid",
+    E_CAPTCHA: "request_rejected", E_IP_LIMITED: "request_rejected",
+    E_PHONE_COOLDOWN: "request_rejected", E_BUSY: "request_rejected",
+    E_FLOOD: "flood", E_CODE_INVALID: "code_invalid", E_STATE_EXPIRED: "state_expired",
+    E_TELEGRAM: "telegram_error", E_BLOCKED: "blocked", E_NETWORK: "network",
+}
+
+
+def _count_result(stage: str):
+    """统一统计两个业务接口的实际返回结果，覆盖校验、限流和业务失败。"""
+    def decorate(handler):
+        @wraps(handler)
+        async def counted(req: Request):
+            response = await handler(req)
+            payload = json.loads(response.body)
+            success = payload["code"] == 0
+            kind = "unknown" if success else (getattr(response, "stats_kind", None) or _FAILURE_KIND_BY_CODE[payload["code"]])
+            try:
+                _record_stats(stage, success=success, kind=kind, existed=payload["data"].get("existed", False))
+            except sqlite3.Error as error:
+                # 已成功的 Telegram 操作不重放、不丢弃结果，明确报告统计写入失败。
+                print(f"[stats] save failed: {type(error).__name__}", flush=True)
+                payload["data"]["stats_warning"] = "统计保存失败，请联系管理员；本次操作结果仍有效"
+                return JSONResponse(payload, status_code=response.status_code, headers={"Cache-Control": "no-store"})
+            return response
+        return counted
+    return decorate
 
 
 def _tg_err(e: MyTelegramError, *, flow_closed: bool = False) -> JSONResponse:
@@ -210,7 +241,7 @@ def _tg_err(e: MyTelegramError, *, flow_closed: bool = False) -> JSONResponse:
         "network": E_NETWORK,
     }
     return fail(code_map.get(e.kind, E_TELEGRAM), e.message, e.original,
-                {"flow_closed": True} if flow_closed else None)
+                {"flow_closed": True} if flow_closed else None, stats_kind=e.kind)
 
 
 async def _close_flow(state: dict) -> None:
@@ -352,6 +383,7 @@ async def pow_challenge(req: Request):
 
 
 @app.post("/api/send-code")
+@_count_result("send")
 async def send_code(req: Request):
     await _cleanup_expired()
     body = await _read_json_body(req)
@@ -402,25 +434,23 @@ async def send_code(req: Request):
         )
         _state[request_id] = state
         retained = True
-        _bump("send_code_ok")
         return response
     except MyTelegramError as e:
         if e.kind == "network" and e.request_not_sent:
             _phone_last.pop(phone, None)
-        _bump("send_code_fail", e.kind)
         return _tg_err(e)
     except Exception as e:
         print(f"[flow] send_code failed: {type(e).__name__}", flush=True)
         if state["client"] is None:
             _phone_last.pop(phone, None)
-        _bump("send_code_fail", "unknown")
-        return fail(E_TELEGRAM, "发送失败，请联系管理员检查服务配置或运行日志")
+        return fail(E_TELEGRAM, "发送失败，请联系管理员检查服务配置或运行日志", stats_kind="unknown")
     finally:
         if not retained:
             await _close_flow(state)
 
 
 @app.post("/api/create-app")
+@_count_result("create")
 async def create_app(req: Request):
     await _cleanup_expired()
     body = await _read_json_body(req)
@@ -446,15 +476,11 @@ async def create_app(req: Request):
     try:
         await client.login(state["phone"], state["random_hash"], code)
         result = await client.create_app()
-        _bump("create_ok")
-        if result.existed:
-            _bump("create_existed")
         return ok(
             {"api_id": result.api_id, "api_hash": result.api_hash, "existed": result.existed},
             "查询成功" if result.existed else "申请成功",
         )
     except MyTelegramError as e:
-        _bump("create_fail", e.kind)
         if e.kind == "code_invalid":
             # 输错次数达到 CODE_ATTEMPT_LIMIT 后强制作废流程。
             state["code_attempts"] += 1
@@ -478,8 +504,7 @@ async def create_app(req: Request):
         return _tg_err(e, flow_closed=True)
     except Exception as e:
         print(f"[flow] create_app failed: {type(e).__name__}", flush=True)
-        _bump("create_fail", "unknown")
-        return fail(E_TELEGRAM, "申请失败，本次流程已结束，请联系管理员检查运行日志", extra={"flow_closed": True})
+        return fail(E_TELEGRAM, "申请失败，本次流程已结束，请联系管理员检查运行日志", extra={"flow_closed": True}, stats_kind="unknown")
     finally:
         if retained:
             state["processing"] = False
@@ -496,9 +521,10 @@ _FAIL_ZH = {
     "telegram_error": "Telegram 拒绝",
     "phone_invalid": "手机号无效",
     "unknown": "未知错误",
+    "request_rejected": "本站限制",
+    "state_expired": "流程失效",
+    "request_invalid": "请求格式错误",
 }
-_SEND_FAILURE_KINDS = ("flood", "network", "phone_invalid", "blocked", "telegram_error", "unknown")
-_CREATE_FAILURE_KINDS = ("code_invalid", "flood", "network", "blocked", "telegram_error", "unknown")
 
 
 def _stats_data() -> dict:
@@ -506,16 +532,20 @@ def _stats_data() -> dict:
     def zh(d: dict, kinds: tuple[str, ...]) -> dict:
         return {_FAIL_ZH[k]: d.get(k, 0) for k in kinds}
 
-    total = _stats["create_ok"]
-    existing = _stats["create_existed"]
+    if _stats_store is None:
+        raise RuntimeError("统计存储尚未初始化")
+    counts = _stats_store.snapshot()
+    total = counts["create_ok"]
+    existing = counts["create_existed"]
     return {
-        "验证码发送成功": _stats["send_code_ok"],
-        "验证码发送失败": zh(_stats["send_code_fail"], _SEND_FAILURE_KINDS),
+        "验证码发送成功": counts["send_code_ok"],
+        "验证码发送失败": zh(counts["send_code_fail"], SEND_FAILURE_KINDS),
         "申请成功": total - existing,
         "查询成功": existing,
-        "成功合计": total,
-        "申请或查询失败": zh(_stats["create_fail"], _CREATE_FAILURE_KINDS),
-        "统计时段": "自服务启动以来（重启清零）",
+        "总成功": total,
+        "总失败": sum(counts["send_code_fail"].values()) + sum(counts["create_fail"].values()),
+        "申请或查询失败": zh(counts["create_fail"], CREATE_FAILURE_KINDS),
+        "统计时段": "累计统计（重启保留）",
     }
 
 
@@ -578,7 +608,8 @@ def _render_index() -> str:
         "STATS_EXISTED": count(data["查询成功"]),
         "STATS_SEND_OK": count(data["验证码发送成功"]),
         "STATS_SEND_FAIL": count(sum(data["验证码发送失败"].values())),
-        "STATS_CREATE_OK": count(data["成功合计"]),
+        "STATS_TOTAL_OK": count(data["总成功"]),
+        "STATS_TOTAL_FAIL": count(data["总失败"]),
         "STATS_CREATE_FAIL": count(sum(data["申请或查询失败"].values())),
         "STATS_SEND_REASONS": reasons(data["验证码发送失败"]),
         "STATS_CREATE_REASONS": reasons(data["申请或查询失败"]),
